@@ -1,0 +1,170 @@
+"""
+@Author: Penghao Tian <tph@ustc.edu.cn>
+@Date: 2025-12-27 01:26
+@Description:
+Use data classified by unsupervised methods
+to compute the corresponding s4max data
+"""
+
+
+import os 
+import sys
+from pathlib import Path
+import argparse
+import numpy as np
+import pandas as pd
+import xarray as xr
+import einops
+import configparser
+from datetime import datetime
+
+import joblib
+
+from collections import defaultdict
+import utils
+
+
+
+class Fetch_COSMIC_Based_Clustering():
+    """
+    Extract the corresponding COSMIC observations from the clustering results
+    """
+    
+    def __init__(self, cosmic_file=None, label_file=None, group_type_dict=None):
+        
+        self._load_data(cosmic_file, label_file)
+        
+        self.cosmic_file = cosmic_file
+        self.label_file = Path(label_file)
+        self.group_type_dict = group_type_dict
+        
+        pass
+    
+    def _load_data(self, cosmic_file, label_file):
+        """
+        Process COSMIC 1 and 2 data
+        and the corresponding label data
+        
+        """
+        cosmic_df = xr.open_dataset(cosmic_file)
+        
+        # Extracting the corresponding NumPy data from df is very slow, possibly due to data copying and transfer
+        # Extract all NumPy data first
+        self.s4 = cosmic_df["s4"].to_numpy()
+        self.ut = cosmic_df.coords["n_time"].to_numpy()
+        self.lat = cosmic_df["lat"].to_numpy()
+        self.lon = cosmic_df["lon"].to_numpy()
+        
+        cosmic_df.close()
+        
+        self.final_label = joblib.load(label_file)
+        pass
+    
+    def _select_data_from_label(self, idx_label):
+        """
+        Select the corresponding dataframe results using the label list
+        
+        idx_label: [0, 1, 2, ...]
+        """
+        if len(idx_label) == 1:
+            select_idx = (self.final_label == idx_label[0])
+            pass
+        else:
+            # Combine labels from multiple clusters to obtain all cluster selection indices
+            idx_array = [(self.final_label==i) for i in idx_label]
+            select_idx = False
+            for k in idx_array:
+                select_idx = select_idx + k
+                pass
+            pass
+        
+        return select_idx
+    
+    
+    def _generate_each_group_data(self, group_type=None):
+        """
+        Generate the corresponding data and complete the calculations for the group
+        
+        group_type: a b c d e bc de
+        time: Time partitioning that determines the time range and limits the data distribution
+        """
+        
+        used_group = self.group_type_dict[group_type]
+        select_idx = self._select_data_from_label(idx_label=used_group)
+        
+        s4 = self.s4[select_idx, :]
+        ut = self.ut[select_idx]
+        lat = self.lat[select_idx, :]
+        lon = self.lon[select_idx, :]
+        
+        
+        # Compute the corresponding geomagnetic latitude and lct
+        # Compute the altitude, magnitude, and geographic location of the maximum s4
+        s4max = s4.max(axis=1)
+        s4max_idx = np.argmax(s4, axis=1)
+        m_alt = np.arange(80, 401, 2.5)
+        s4max_alt = m_alt[s4max_idx]
+        
+        idx_expanded = np.expand_dims(s4max_idx, axis=1)
+        s4max_lat = np.take_along_axis(lat, idx_expanded, axis=1).squeeze()
+        s4max_lon = np.take_along_axis(lon, idx_expanded, axis=1).squeeze()
+        
+        # Compute the corresponding geomagnetic latitude distribution and local time
+        s4max_mlat = utils.Aux1.glat2diplat(s4max_lat, s4max_lon, s4max_alt)
+        
+        ut_hours = utils.Aux1.datetime64_to_hours_of_day(ut)
+        s4max_lct, _ = utils.Aux1.utc_hours_and_lon_to_local_time(ut_hours, s4max_lon)
+        
+        doy = pd.to_datetime(ut).day_of_year.to_numpy(dtype=np.float32)
+        # breakpoint()
+        return (ut, doy, s4max, s4max_lat, s4max_lon, s4max_alt, 
+                s4max_mlat, s4max_lct)
+    
+    def process_data(self,):
+        
+        group_type = ["a", "b", "c", "d", "e"]
+        
+        for gt in group_type:
+            (ut, doy, s4max, s4max_lat, s4max_lon, s4max_alt, 
+             s4max_mlat, s4max_lct) = self._generate_each_group_data(group_type=gt)
+            
+            sdf = pd.DataFrame({"cosmic_time": ut, "doy": doy,
+                                "lat": s4max_lat, "lon": s4max_lon,
+                                "alt": s4max_alt.astype(np.float32), 
+                                "lct": s4max_lct.astype(np.float32), "mlat": s4max_mlat,
+                                "s4max": s4max})
+            
+            save_file = self.label_file.parent.joinpath(f"group_{gt}_based_{self.label_file.stem}.h5").resolve()
+            sdf.to_hdf(save_file, key="data")
+        
+        pass
+    
+    pass
+
+
+if __name__ == "__main__":
+    """
+    python fetch_data_from_clustering.py
+    """
+    
+    # All comsic files used
+    cosmic_file = "./data/cosmic_1_2_s4_2007_2025_process_snr_filter_4.nc"
+    
+    # Label file generated by model clustering
+    label_file = "./config_02/kmeans_final_labels_25_42.pkl"
+    # Manually define the categories based on the labels above
+    group_A = [0, 5, 9, 14, 20]
+    group_B = [1, 8, 13, 23]
+    group_C = [2, 4, 7, 12, 16, 19, 24]
+    group_D = [6, 10, 11, 17, 18]
+    group_E = [3, 15, 21, 22]
+
+    group_type_dict = {"a": group_A, "b": group_B, "c": group_C,
+                       "d": group_D, "e": group_E, }
+    #
+    
+
+    obj = Fetch_COSMIC_Based_Clustering(cosmic_file=cosmic_file,
+                                        label_file=label_file,
+                                        group_type_dict=group_type_dict)
+    obj.process_data()
